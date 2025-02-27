@@ -20,9 +20,14 @@ class QuestionRequest(BaseModel):
             }
         }
 
+class KeywordClarificationRequest(BaseModel):
+    question: str
+    keywords: str
+
 class QuestionResponse(BaseModel):
     answer: str
     sources: list[str]
+    needs_clarification: bool = False
 
 app = FastAPI()
 
@@ -80,10 +85,11 @@ async def ask(request: QuestionRequest):
 
     if vector_store is None:
         try:
+            # Try loading vector store again
             vector_store = create_or_load_faiss()
             if vector_store is None:
                 raise HTTPException(
-                    status_code=400,
+                    status_code=400, 
                     detail="⚠️ No documents available. Please upload a document first."
                 )
         except Exception as e:
@@ -93,11 +99,57 @@ async def ask(request: QuestionRequest):
             )
 
     try:
+        # Create RAG bot with the vector store
         qa_chain = create_rag_bot(vector_store)
-        answer, sources = ask_question(qa_chain, request.question, file_urls)
+        answer, sources, needs_clarification_flag = ask_question(qa_chain, request.question, file_urls)
+        
+        return QuestionResponse(
+            answer=answer, 
+            sources=sources,
+            needs_clarification=needs_clarification_flag
+        )
+    
+    except Exception as e:
+        logger.error(f"⚠️ Internal Server Error: {e}")
+        raise HTTPException(status_code=500, detail=f"⚠️ Internal Server Error: {str(e)}")
 
-        return QuestionResponse(answer=answer, sources=sources)
+@app.post("/ask_with_keywords/", response_model=QuestionResponse)
+async def ask_with_keywords(request: KeywordClarificationRequest):
+    """
+    Ask a question with additional clarifying keywords.
+    """
+    global vector_store
 
+    if vector_store is None:
+        try:
+            vector_store = create_or_load_faiss()
+            if vector_store is None:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="⚠️ No documents available. Please upload a document first."
+                )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail="⚠️ No documents available. Please upload a document first."
+            )
+
+    try:
+        # Create RAG bot with the vector store
+        qa_chain = create_rag_bot(vector_store)
+        answer, sources, needs_clarification_flag = ask_question(
+            qa_chain, 
+            request.question, 
+            file_urls,
+            keywords=request.keywords
+        )
+        
+        return QuestionResponse(
+            answer=answer, 
+            sources=sources,
+            needs_clarification=needs_clarification_flag
+        )
+    
     except Exception as e:
         logger.error(f"⚠️ Internal Server Error: {e}")
         raise HTTPException(status_code=500, detail=f"⚠️ Internal Server Error: {str(e)}")
