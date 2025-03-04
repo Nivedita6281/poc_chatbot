@@ -12,11 +12,13 @@ from config import S3_BUCKET_NAME
 
 class QuestionRequest(BaseModel):
     question: str
+    keywords: str = None  # Make keywords optional
 
     class Config:
         json_schema_extra = {
             "example": {
-                "query": "Your Question here"
+                "question": "Your Question here",
+                "keywords": "Optional keywords"  # Example with keywords
             }
         }
 
@@ -94,7 +96,8 @@ async def ask(request: QuestionRequest):
 
     try:
         qa_chain = create_rag_bot(vector_store)
-        answer, sources = ask_question(qa_chain, request.question, file_urls)
+        # Make sure to pass keywords parameter
+        answer, sources = ask_question(qa_chain, request.question, file_urls, request.keywords)
 
         return QuestionResponse(answer=answer, sources=sources)
 
