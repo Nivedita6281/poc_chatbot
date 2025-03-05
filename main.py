@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, UploadFile, Request, HTTPException
+from fastapi import FastAPI, UploadFile, HTTPException
 import shutil
 from pydantic import BaseModel
 import os
@@ -11,14 +11,12 @@ from rag_bot import create_rag_bot, ask_question, load_csv_from_s3
 from config import S3_BUCKET_NAME
 
 class QuestionRequest(BaseModel):
-    question: str
-    keywords: str = None  # Make keywords optional
+    question: str  # Only `question`, no separate `keywords` field
 
     class Config:
         json_schema_extra = {
             "example": {
-                "question": "Your Question here",
-                "keywords": "Optional keywords"  # Example with keywords
+                "question": "Your question with relevant keywords"
             }
         }
 
@@ -41,7 +39,6 @@ file_urls = load_csv_from_s3(S3_BUCKET_NAME, "Urls.csv")
 async def startup_event():
     global vector_store
     try:
-        # Load the vector store directly, not as a retriever
         vector_store = create_or_load_faiss()
         print("✅ Loaded existing vector store from S3")
     except Exception as e:
@@ -51,7 +48,6 @@ async def startup_event():
 @app.post("/upload/")
 async def upload_document(file: UploadFile):
     global vector_store
-
     try:
         temp_file_path = os.path.join(tempfile.gettempdir(), file.filename)
         with open(temp_file_path, "wb") as buffer:
@@ -65,8 +61,7 @@ async def upload_document(file: UploadFile):
         logger.info(f"Processing file {file.filename} for vector store...")
         chunks = ingest_documents(temp_file_path)
         vector_store = create_vector_store_with_retry(chunks, os.getenv("OPENAI_API_KEY"))
-        vector_store.save_local("faiss_index")  # Save to avoid reloading issues
-
+        vector_store.save_local("faiss_index")  
 
         return {"message": "File uploaded & indexed successfully!", "index_name": "latest.index"}
     except Exception as e:
@@ -96,8 +91,7 @@ async def ask(request: QuestionRequest):
 
     try:
         qa_chain = create_rag_bot(vector_store)
-        # Make sure to pass keywords parameter
-        answer, sources = ask_question(qa_chain, request.question, file_urls, request.keywords)
+        answer, sources = ask_question(qa_chain, request.question, file_urls)  # Only passing `question`
 
         return QuestionResponse(answer=answer, sources=sources)
 
