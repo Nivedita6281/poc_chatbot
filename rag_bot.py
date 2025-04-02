@@ -6,7 +6,12 @@ from langchain.prompts import PromptTemplate
 import logging
 import boto3
 import csv
+import numpy as np
 from fuzzywuzzy import process, fuzz
+from rank_bm25 import BM25Okapi
+from langchain.vectorstores import FAISS
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 s3_client = boto3.client("s3")
@@ -29,17 +34,62 @@ def load_csv_from_s3(bucket_name, csv_key):
         logger.error(f"Error reading CSV from S3: {e}")
         return {}  # Return empty dict instead of None to avoid NoneType errors
 
+def load_documents():
+    """Load and preprocess documents from S3 or local storage."""
+    docs = [...]  # Load documents as a list of strings
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    split_docs = text_splitter.split_documents(docs)
+    return split_docs
+
+def create_hybrid_retriever(documents):
+    """Create hybrid search using BM25 and FAISS."""
+    tokenized_docs = [doc.page_content.split() for doc in documents]
+    bm25 = BM25Okapi(tokenized_docs)
+    embeddings = OpenAIEmbeddings()
+    vector_store = FAISS.from_documents(documents, embeddings)
+    return bm25, vector_store
+
+def hybrid_search(query, bm25, vector_store, k=5):
+    """Perform hybrid search by combining BM25 and FAISS results."""
+    tokenized_query = query.split()
+
+    # BM25 Search
+    bm25_scores = bm25.get_scores(tokenized_query)
+    bm25_top_indexes = np.argsort(bm25_scores)[::-1][:k]
+    bm25_results = [(bm25_scores[i], i) for i in bm25_top_indexes]
+
+    # FAISS Search (Fix: Use `.as_retriever()` correctly)
+    faiss_retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": k})
+    faiss_docs = faiss_retriever.get_relevant_documents(query)
+
+    doc_scores = {}
+
+    # Fix: Ensure FAISS documents are correctly retrieved and stored
+    for doc in faiss_docs:
+        source = doc.metadata.get("source", "Unknown")
+        doc_scores[source] = doc_scores.get(source, 0) + 1.0  # Weighted contribution
+
+    # Add BM25 results
+    for score, idx in bm25_results:
+        source = f"BM25_Doc_{idx}"
+        doc_scores[source] = doc_scores.get(source, 0) + score
+
+    # Sort final results
+    sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+
+    return [doc[0] for doc in sorted_docs[:k]]
+
 def create_rag_bot(vector_store):
-    """Creates a Retrieval-Augmented Generation (RAG) bot with improved retrieval."""
+    """Creates a RAG bot using hybrid retrieval (BM25 + FAISS)."""
     if vector_store is None:
         raise ValueError("⚠️ FAISS vector store is not loaded. Please upload documents first.")
 
-    # ✅ Use similarity search for better diversity and relevance
+    # ✅ Fix: Use FAISS correctly by extracting retriever
     retriever = vector_store.as_retriever(
-        search_type="similarity",  
-        search_kwargs={"k": 5, "fetch_k": 10, "lambda_mult": 0.7}  # Fetch more, then filter
+        search_type="similarity",
+        search_kwargs={"k": 5}  # Adjust k as needed
     )
-    
+
     llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3)
 
     qa_chain = RetrievalQA.from_chain_type(
@@ -48,11 +98,18 @@ def create_rag_bot(vector_store):
         retriever=retriever,
         return_source_documents=True
     )
-
+ 
     return qa_chain
 
 # ✅ Static answers for frequently asked questions
 static_answers = {
+    "hi": "Hi! How can I assist you with EA-related questions today?",
+    "hello": "Hello there! What EA-related questions can I help you with?",
+    "hey": "Hey! Ready to help with any EA games or services questions.",
+    "good morning": "Good morning! What EA-related assistance do you need today?",
+    "good afternoon": "Good afternoon! How can I help with EA products or services?",
+    "good evening": "Good evening! What EA questions can I answer for you?",
+    "how are you":"I'm just a bot, but thanks for asking! How can I help with EA today?",
     "refund": "Find out how to get a refund for games that qualify under the Great Game Guarantee: https://help.ea.com/en-us/help/account/returns-and-cancellations/",
     "delete account": "To delete your EA account, visit: https://help.ea.com/en/help/account/close-ea-account",
     "reset password": "To reset your password, visit: https://ea.com/reset-password",
@@ -67,43 +124,28 @@ ambiguous_phrases = [
     "can I use this?", "will this affect my game?", "is it required?"
 ]
 
-def check_document_relevance(doc, question, threshold=0.5):
-    """Check if a document is relevant to the question."""
-    # Simple relevance check based on content overlap
+def check_document_relevance(doc, question, threshold=0.3):  # Lower threshold
     doc_content = doc.page_content.lower()
     question_words = set(question.lower().split())
-    
-    # Count overlapping words
     overlap_count = sum(1 for word in question_words if word in doc_content)
     relevance_score = overlap_count / len(question_words) if question_words else 0
-    
     return relevance_score >= threshold
 
-def retrieve_with_retry(qa_chain, question, retries=3):
-    """Retries document retrieval multiple times with improved error handling."""
+import time
+def retrieve_with_retry(qa_chain, question, retries=5, delay=1):
     for attempt in range(retries):
         try:
             response = qa_chain({"query": question})
-            
-            # Check if we have source documents
             if response and response.get("source_documents"):
-                # Filter for relevant documents
                 relevant_docs = [doc for doc in response["source_documents"] 
                                if check_document_relevance(doc, question)]
-                
                 if relevant_docs:
-                    # Update response with only relevant documents
                     response["source_documents"] = relevant_docs
                     return response
-                else:
-                    logger.warning(f"⚠️ Retrieved documents on attempt {attempt+1} but none were relevant. Retrying...")
-            else:
-                logger.warning(f"⚠️ No documents retrieved on attempt {attempt+1}. Retrying...")
-                
+            time.sleep(delay)  # Add delay between retries
         except Exception as e:
-            logger.error(f"⚠️ Error during retrieval attempt {attempt+1}: {e}")
-
-    # After all retries, return structured error response instead of None
+            logger.error(f"Retrieval attempt {attempt+1} failed: {e}")
+            time.sleep(delay)
     return {
         "result": "I couldn't find sufficiently relevant information in our knowledge base for your question.",
         "source_documents": []
@@ -217,7 +259,7 @@ Instructions:
 - Response should retrive if question is related to EA and give atleast 5 points.
 
 Handling Different Cases:
-- If the question is **unrelated to EA**, respond with:  
+- If the question is **unrelated to EA** then respond with:  
   "This question does not seem related to EA. Please ask about EA-related topics."
 - If the question is **unclear or too vague**, ask for clarification:  
   "Can you please provide more details or specify what you're asking?"
@@ -267,4 +309,3 @@ Enhanced Answer:"""
     except Exception as e:
         logger.error(f"⚠️ Error processing query: {e}")
         return f"⚠️ Sorry, I encountered an error while processing your question: {str(e)}", []
-    
