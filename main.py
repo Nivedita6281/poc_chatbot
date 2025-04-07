@@ -5,6 +5,8 @@ import os
 import boto3
 import logging
 import tempfile
+from typing import Optional, Union
+from fastapi.responses import JSONResponse
 from ingest import ingest_documents, create_vector_store_with_retry, create_or_load_faiss
 from rag_bot import create_rag_bot, ask_question, load_csv_from_s3, session_memory
 from config import S3_BUCKET_NAME
@@ -22,7 +24,7 @@ class QuestionRequest(BaseModel):
 
 class QuestionResponse(BaseModel):
     answer: str
-    sources: list[str]
+    sources: Optional[list[str]]=None
 
 app = FastAPI()
 
@@ -105,10 +107,18 @@ async def ask(request: QuestionRequest, req: Request, res: Response):
         qa_chain = create_rag_bot(vector_store)
         
         # ✅ FIX: Pass `file_urls` when calling `ask_question()`
-        answer, sources = ask_question(qa_chain, request.question, session_id, file_urls)
-
-        return QuestionResponse(answer=answer, sources=sources)
-
+        response = ask_question(qa_chain, request.question, session_id, file_urls)
+        # Ensure we always return a proper JSON structure
+        if isinstance(response, dict):
+            if "sources" not in response:
+                return JSONResponse(content={"answer": response["answer"]})
+            return response
+        else:
+            # Handle unexpected string responses (shouldn't happen with above fixes)
+            return JSONResponse(content={"answer": str(response)})
     except Exception as e:
         logger.error(f"⚠️ Internal Server Error: {e}")
-        raise HTTPException(status_code=500, detail=f"⚠️ Internal Server Error: {str(e)}")
+        return JSONResponse(
+            content={"answer": f"⚠️ Internal Server Error: {str(e)}"},
+            status_code=500
+        )
