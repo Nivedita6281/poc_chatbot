@@ -13,6 +13,7 @@ pdf2image
 pytesseract
 pypdf
 pandas
+rank_bm25
 rapidfuzz
 fuzzywuzzy
 aioboto3
