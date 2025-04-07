@@ -14,5 +14,6 @@ pytesseract
 pypdf
 pandas
 rapidfuzz
+rank_bm25
 fuzzywuzzy
 aioboto3
