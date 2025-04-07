@@ -50,34 +50,24 @@ def create_hybrid_retriever(documents):
     return bm25, vector_store
 
 def hybrid_search(query, bm25, vector_store, k=5):
-    """Perform hybrid search by combining BM25 and FAISS results."""
-    tokenized_query = query.split()
-
-    # BM25 Search
-    bm25_scores = bm25.get_scores(tokenized_query)
-    bm25_top_indexes = np.argsort(bm25_scores)[::-1][:k]
-    bm25_results = [(bm25_scores[i], i) for i in bm25_top_indexes]
-
-    # FAISS Search (Fix: Use `.as_retriever()` correctly)
-    faiss_retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": k})
-    faiss_docs = faiss_retriever.get_relevant_documents(query)
-
-    doc_scores = {}
-
-    # Fix: Ensure FAISS documents are correctly retrieved and stored
-    for doc in faiss_docs:
-        source = doc.metadata.get("source", "Unknown")
-        doc_scores[source] = doc_scores.get(source, 0) + 1.0  # Weighted contribution
-
-    # Add BM25 results
-    for score, idx in bm25_results:
-        source = f"BM25_Doc_{idx}"
-        doc_scores[source] = doc_scores.get(source, 0) + score
-
-    # Sort final results
-    sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
-
-    return [doc[0] for doc in sorted_docs[:k]]
+    # BM25: Get top-k docs with scores
+    bm25_scores = bm25.get_scores(query.split())
+    bm25_docs = [(score, idx) for idx, score in enumerate(bm25_scores)]
+    bm25_docs.sort(reverse=True, key=lambda x: x[0])
+    
+    # FAISS: Get top-k docs
+    faiss_docs = vector_store.similarity_search(query, k=k)
+    
+    # Combine results (weighted average)
+    combined = []
+    for idx, (score, _) in enumerate(bm25_docs[:k]):
+        combined.append(("bm25", idx, score * 0.6))  # BM25 weight: 60%
+    for idx, doc in enumerate(faiss_docs):
+        combined.append(("faiss", idx, 0.4))  # FAISS weight: 40%
+    
+    # Sort by combined score
+    combined.sort(key=lambda x: x[2], reverse=True)
+    return combined[:k]
 
 def create_rag_bot(vector_store):
     """Creates a RAG bot using hybrid retrieval (BM25 + FAISS)."""
@@ -87,7 +77,7 @@ def create_rag_bot(vector_store):
     # ✅ Fix: Use FAISS correctly by extracting retriever
     retriever = vector_store.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": 5}  # Adjust k as needed
+        search_kwargs={"k":5}  # Adjust k as needed
     )
 
     llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3)
@@ -116,6 +106,45 @@ static_answers = {
     "cross-play": "Cross-play in NHL® 25 lets you play with friends across PlayStation® and Xbox. Read more here: https://help.ea.com/in/cross-play-guide",
     "crafting metals": "Find more about Crafting Metals and Legend Tokens here: https://help.ea.com/in/solutions/?product=apex-legends&platform=&topic=metals-tokens-info",
 }
+# Add this to your existing static answers and ambiguous phrases
+CLARIFICATION_LEVELS = {
+    'game_features': {
+        'triggers': ['fifa', 'madden', 'apex', 'nhl', 'game', 'feature', 'problem', 'issue', 'mode'],
+        'level1': "Which specific game are you asking about? (1) FIFA 2) Madden 3) Apex Legends 4) NHL",
+        'level2': {
+            'fifa': "What aspect of FIFA? (1) Ultimate Team 2) Career Mode 3) Gameplay 4) Online Modes",
+            'madden': "What aspect of Madden? (1) Franchise Mode 2) MUT 3) Gameplay",
+            'apex legends': "What aspect of Apex? (1) Legends 2) Weapons 3) Battle Pass"
+        }
+    },
+    'technical': {
+        'triggers': ['crash', 'lag', 'server', 'performance', 'error', 'bug', 'glitch', 'connection'],
+        'level1': "Is this about: 1) Server issues 2) Connectivity 3) Game performance?",
+        'level2': {
+            'server issues': "Are you experiencing: 1) Login problems 2) Disconnections 3) Matchmaking?",
+            'connectivity': "Is this about: 1) NAT type 2) Port forwarding 3) General connection?",
+            'performance': "Are you having: 1) FPS drops 2) Crashing 3) Graphical glitches?"
+        }
+    },
+    'account': {
+        'triggers': ['account', 'login', 'password', 'ea play', 'subscription', 'sign in', 'profile'],
+        'level1': "Are you having issues with: 1) Login 2) Account recovery 3) Subscriptions?",
+        'level2': {
+            'login': "Is this about: 1) Password reset 2) 2FA 3) Banned account?",
+            'account recovery': "Do you need help with: 1) Hacked account 2) Email change 3) Profile recovery?",
+            'subscriptions': "Is this about: 1) EA Play 2) Payment issues 3) Cancellation?"
+        }
+    },
+    'purchase': {
+        'triggers': ['purchase', 'refund', 'price', 'microtransaction', 'fifa points', 'buy', 'order'],
+        'level1': "Is this about: 1) Refunds 2) Payment issues 3) In-game purchases?",
+        'level2': {
+            'refunds': "Are you asking about: 1) Eligibility 2) Process 3) Timeframe?",
+            'payment issues': "Is this about: 1) Declined payment 2) Missing content 3) Incorrect charges?",
+            'in-game purchases': "Are you asking about: 1) FIFA Points 2) Apex Coins 3) Missing items?"
+        }
+    }
+}
 
 # ✅ Ambiguous questions that need clarification
 ambiguous_phrases = [
@@ -123,8 +152,9 @@ ambiguous_phrases = [
     "does it work online?", "is it enabled?", "is it better?", "do I need it?",
     "can I use this?", "will this affect my game?", "is it required?"
 ]
-
 def check_document_relevance(doc, question, threshold=0.3):  # Lower threshold
+    if any(keyword in question.lower() for keyword in ["reaction", "feedback", "community","strategies","teams"]):
+        threshold = 0.1  # Lower threshold for subjective queries
     doc_content = doc.page_content.lower()
     question_words = set(question.lower().split())
     overlap_count = sum(1 for word in question_words if word in doc_content)
@@ -150,41 +180,118 @@ def retrieve_with_retry(qa_chain, question, retries=5, delay=1):
         "result": "I couldn't find sufficiently relevant information in our knowledge base for your question.",
         "source_documents": []
     }
-
+def is_filtered_query_type(answer):
+    """Determine if the answer indicates a greeting, unrelated query, or need for clarification."""
+    answer_lower = answer.lower()
+    # Check for greeting patterns in the answer
+    greeting_indicators = [
+        "hi! how can i assist you", 
+        "hello there!", 
+        "hey! ready to help",
+        "good morning! what ea-related",
+        "good afternoon! how can i help",
+        "good evening! what ea",
+        "i'm just a bot, but thanks for asking"
+    ]
+    # Check for unrelated query patterns
+    unrelated_indicators = [
+        "not seem related to ea",
+        "not related to ea",
+        "please ask about ea-related topics",
+        "not sure",
+        "don't have",
+        "sorry",
+        "don't know"
+    ]
+    # Check for clarification request patterns
+    clarification_indicators = [
+        "provide more context or details",
+        "your question seems a bit unclear",
+        "could you provide more specific details",
+        "can you please provide more details"
+    ]
+     # Check if any patterns match
+    if any(indicator in answer_lower for indicator in greeting_indicators + unrelated_indicators + clarification_indicators):
+        return True
+    return False
 def ask_question(qa_chain, question, session_id, file_urls):
     global session_memory
     
     # Initialize session memory if it doesn't exist
     if session_id not in session_memory:
         session_memory[session_id] = []
+    # Check for static answers first
+    best_match = process.extractOne(question.lower(), static_answers.keys(), scorer=fuzz.token_set_ratio)
+    if best_match and best_match[1] > 60:
+        return {"answer": static_answers[best_match[0]]}
+    last_interaction = session_memory[session_id][-1] if session_memory[session_id] else None
+    
+    # Handle clarification responses
+    if last_interaction and isinstance(last_interaction, dict) and last_interaction.get('type') == 'clarification':
+        current_level = last_interaction['level']
+        topic = last_interaction['topic']
+        
+        # Process level 1 response
+        if current_level == 1:
+            # Try to match the response to one of our options
+            response_text = question.strip().lower()
+            best_match, score = process.extractOne(response_text, CLARIFICATION_LEVELS[topic]['level2'].keys())
+            
+            if score > 60:  # If we have a good match
+                session_memory[session_id].append({
+                    'type': 'clarification',
+                    'level': 2,
+                    'topic': topic,
+                    'subtopic': best_match,
+                    'original': last_interaction['original']
+                })
+                return {
+                    "answer": CLARIFICATION_LEVELS[topic]['level2'][best_match],
+                    "needs_clarification": True
+                }
+        
+        # Process level 2 response
+        elif current_level == 2:
+            focused_question = (
+                f"{last_interaction['original']}\n"
+                f"Game: {last_interaction['subtopic']}\n"
+                f"Specific issue: {question}"
+            )
+            return _process_question(qa_chain, focused_question, session_id, file_urls)
+    
+    # Detect topics that need clarification
+    detected_topics = []
+    question_lower = question.lower()
+    
+    for topic, config in CLARIFICATION_LEVELS.items():
+        if 'triggers' in config:
+            if any(trigger in question_lower for trigger in config['triggers']):
+                detected_topics.append(topic)
+    
+    # Check if the question is ambiguous and related to a detected topic
+    is_ambiguous = any(phrase in question_lower for phrase in ambiguous_phrases)
+    
+    if detected_topics and is_ambiguous:
+        primary_topic = detected_topics[0]  # Take the first matching topic
+        session_memory[session_id].append({
+            'type': 'clarification',
+            'level': 1,
+            'topic': primary_topic,
+            'original': question
+        })
+        return {
+            "answer": CLARIFICATION_LEVELS[primary_topic]['level1'],
+            "needs_clarification": True
+        }
+    
+    # Rest of your existing function...
+    return _process_question(qa_chain, question, session_id, file_urls)
 
-    # Validate input
-    if not question or not question.strip():
-        return "⚠️ Please provide a valid question.", []
-
-    # ✅ Check if the same question was asked before (fetch from memory)
-    for entry in session_memory[session_id]:
-        if entry.startswith(f"Q: {question}"):
-            answer = entry.split("A: ")[-1]
-            logger.info("✅ Fetching from session memory")
-            return answer, []
-
-    # ✅ Get previous conversations (last 10 interactions for context)
-    previous_interactions = "\n".join(session_memory[session_id][-10:]) if session_memory[session_id] else "No prior conversation."
-
-    # ✅ Check for static answers with improved matching
-    best_match = process.extractOne(question.lower(), static_answers.keys(), 
-                                   scorer=fuzz.token_set_ratio)  # Better handles word order
-    if best_match:
-        matched_key, score = best_match[0], best_match[1]
-        if score > 60:  # Adjusted threshold
-            logger.info(f"✅ Static answer match found with score {score}: {matched_key}")
-            return static_answers[matched_key], []
-
-    # ✅ Handle ambiguous questions before querying vector store
-    if any(phrase in question.lower() for phrase in ambiguous_phrases):
-        return "❓ Your question seems a bit unclear. Could you provide more specific details about what you're looking for?", []
-
+def _process_question(qa_chain, question, session_id, file_urls):
+    """Handle actual question processing after clarifications"""
+    # Your existing RAG processing logic here
+    rag_response = retrieve_with_retry(qa_chain, question)
+    basic_answer = rag_response.get("result", "⚠️ No relevant information found.")
     try:
         # ✅ FAISS Retrieval with improved Retry logic
         rag_response = retrieve_with_retry(qa_chain, question)
@@ -195,36 +302,41 @@ def ask_question(qa_chain, question, session_id, file_urls):
         
         # If no relevant documents were found, inform the user
         if not source_docs:
-            return "⚠️ I couldn't find any relevant documents that answer your question. Could you rephrase or provide more details?", []
+            return "⚠️ I couldn't find any relevant documents that answer your question. Could you rephrase or provide more details?"
         # ✅ Improved URL mapping with better error handling
         source_strings = []
+        seen_sources = set()
         for doc in source_docs:
             try:
                 source = doc.metadata.get('source', 'Unknown source')
                 filename = os.path.basename(source)
-                
-                # Handle file URL mapping with fallbacks
+            # Handle file URL mapping with fallbacks
                 if file_urls:
                     # Try exact match first
                     if filename in file_urls:
-                        source_strings.append(file_urls[filename])
+                        url = file_urls[filename]
+                        if url not in seen_sources:
+                            source_strings.append(url)
+                            seen_sources.add(url)
                         continue
-                        
                     # Try partial matching if exact match fails
                     for key in file_urls:
                         if key in source or source in key:
-                            source_strings.append(file_urls[key])
+                            url = file_urls[key]
+                            if url not in seen_sources:
+                                source_strings.append(url)
+                                seen_sources.add(url)
                             break
                     else:  # No match found in the for-else pattern
-                        source_strings.append(source.replace("\\", "/"))
-                else:
-                    # If no file_urls mapping available
-                    source_strings.append(source.replace("\\", "/"))
-                    
+                        cleaned_source = source.replace("\\", "/")
+                        if cleaned_source not in seen_sources:
+                            source_strings.append(cleaned_source)
+                            seen_sources.add(cleaned_source)
             except Exception as e:
                 logger.error(f"Error processing source document: {e}")
-                source_strings.append("Source unavailable")
-
+                if "Source unavailable" not in seen_sources:
+                    source_strings.append("Source unavailable")
+                    seen_sources.add("Source unavailable")
         # ✅ Enhance response with full session memory
         llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3)
 
@@ -275,19 +387,16 @@ Enhanced Answer:"""
             template=enhance_template,
             input_variables=["history", "answer", "question", "sources"]
         )
-
         enhance_chain = LLMChain(llm=llm, prompt=enhance_prompt)
-
         # Include sources in the prompt to ensure the model knows what sources were used
         sources_text = "\n".join([f"- {src}" for src in source_strings]) if source_strings else "No specific sources retrieved."
-        
+        previous_interactions = "\n".join(session_memory[session_id][-30:]) if session_memory[session_id] else "No prior conversation."
         enhanced_response = enhance_chain.run(
             history=previous_interactions,
             answer=basic_answer,
             question=question,
             sources=sources_text
-        )
-
+        ).strip() 
         final_answer = enhanced_response
         if any(phrase in final_answer.lower() for phrase in [
             "not seem related to ea", 
@@ -300,12 +409,15 @@ Enhanced Answer:"""
             source_strings = []
        
         # ✅ Store the interaction in session memory
-        session_memory[session_id].append(f"Q: {question}\nA: {final_answer}")
+        session_memory[session_id].append(f"Q: {question}\nA: {final_answer}")  # Append to conversation list
         # Keep only last 30 interactions
         if len(session_memory[session_id]) > 30:
             session_memory[session_id] = session_memory[session_id][-30:]
-        return final_answer, source_strings
-
+        # Return either just answer or answer with sources
+        if is_filtered_query_type(final_answer):
+            return {"answer": final_answer}  # No sources key at all
+        else:
+            return {"answer": final_answer, "sources": source_strings}
     except Exception as e:
         logger.error(f"⚠️ Error processing query: {e}")
-        return f"⚠️ Sorry, I encountered an error while processing your question: {str(e)}", []
+        return {"answer": f"⚠️ Sorry, I encountered an error while processing your question: {str(e)}"}
