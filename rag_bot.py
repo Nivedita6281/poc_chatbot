@@ -168,6 +168,13 @@ static_answers = {
     "good afternoon": "Good afternoon! How can I help with EA products or services?",
     "good evening": "Good evening! What EA questions can I answer for you?",
     "how are you":"I'm just a bot, but thanks for asking! How can I help with EA today?",
+    "bye": "Goodbye! 👋 Have a great day!",
+    "goodbye": "Take care! It was a pleasure assisting you.",
+    "talk to you later": "Sure! Ping me anytime you need help.",
+    "take care": "Take care! Wishing you well.",
+    "until next time": "Until next time, stay safe!",
+    "exit": "Session ended. Goodbye!",
+    "quit": "Shutting down. See you!",
     "refund": "Find out how to get a refund for games that qualify under the Great Game Guarantee: https://help.ea.com/en-us/help/account/returns-and-cancellations/",
     "delete account": "To delete your EA account, visit: https://help.ea.com/en/help/account/close-ea-account",
     "reset password": "To reset your password, visit: https://ea.com/reset-password",
@@ -439,7 +446,6 @@ def handle_follow_up_question(question, last_interaction, context):
             }
             context.add_interaction(question, response['answer'], response['sources'])
             return response
-    
     # Handle summary requests
     if any(phrase in question_lower for phrase in ["key points", "keypoints", "summarize", "recap", "main points"]):
         if last_interaction:
@@ -563,6 +569,8 @@ def _process_question(qa_chain, question, context, file_urls):
         # First check for similar questions in context
         similar_interaction = context.find_similar_question(question)
         if similar_interaction:
+            follow_up_message = get_follow_up_message()
+        if similar_interaction:
             return {
                 "answer": f"Regarding your similar previous question:\n\n{similar_interaction['answer']}",
                 "sources": similar_interaction.get('sources', []),
@@ -670,7 +678,10 @@ Enhanced Answer:"""
         ).strip()
         
         final_answer = enhanced_response
-        
+        # Add follow-up message to encourage further interaction
+        if not is_filtered_query_type(final_answer):
+            follow_up_message = get_follow_up_message()
+            final_answer = f"{final_answer}\n\n{follow_up_message}"
         # Store the interaction
         context.add_interaction(question, final_answer, source_strings)
         
@@ -685,3 +696,22 @@ Enhanced Answer:"""
         error_msg = f"⚠️ Sorry, I encountered an error while processing your question: {str(e)}"
         context.add_interaction(question, error_msg)
         return {"answer": error_msg}
+# Add a new function to generate follow-up messages
+def get_follow_up_message():
+    """Returns a random follow-up message to encourage further interaction"""
+    import random
+    
+    follow_up_messages = [
+        "Feel free to ask if you have any other questions about EA!",
+        "Is there anything else about EA you'd like to know?",
+        "Do you have any other EA-related questions I can help with?",
+        "I'm here to help with any other EA questions you might have.",
+        "Let me know if you need more information about any EA products or services!",
+        "Any other EA-related questions on your mind?",
+        "I'd be happy to help with any other EA questions.",
+        "Anything else about EA games or services you'd like to explore?",
+        "Feel free to ask about other EA topics if you need assistance!",
+        "Need help with anything else related to EA? Just ask!"
+    ]
+    
+    return random.choice(follow_up_messages)
