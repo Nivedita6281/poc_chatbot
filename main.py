@@ -25,6 +25,7 @@ class QuestionRequest(BaseModel):
 class QuestionResponse(BaseModel):
     answer: str
     sources: Optional[list[str]]=None
+    people_can_also_ask: Optional[list[str]]=None
 
 app = FastAPI()
 

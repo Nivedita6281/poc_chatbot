@@ -12,6 +12,7 @@ from rank_bm25 import BM25Okapi
 from langchain.vectorstores import FAISS
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.document_loaders import TextLoader
 import time
 import re
 
@@ -144,8 +145,10 @@ def create_rag_bot(vector_store):
         raise ValueError("⚠️ FAISS vector store is not loaded. Please upload documents first.")
 
     retriever = vector_store.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k":5}  # Adjust k as needed
+        search_type="similarity",  # Use Max Marginal Relevance for better diversity
+        search_kwargs={
+            "k": 8 # Increase number of documents retrieved 
+        }
     )
 
     llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3)
@@ -189,8 +192,8 @@ ambiguous_phrases = [
 ]
 
 def check_document_relevance(doc, question, threshold=0.3):
-    if any(keyword in question.lower() for keyword in ["reaction", "feedback", "community","strategies","teams","Franchise Mode","crash","online modes","Authentication","commentary"]):
-        threshold = 0.1  # Lower threshold for subjective queries
+    if any(keyword in question.lower() for keyword in ["reaction", "feedback","accessibility", "community","strategies","teams","Franchise Mode","crash","online modes","Authentication","commentary","graphicas"]):
+         threshold = 0.1  # Lower threshold for subjective queries
     doc_content = doc.page_content.lower()
     question_words = set(question.lower().split())
     overlap_count = sum(1 for word in question_words if word in doc_content)
@@ -478,6 +481,7 @@ def handle_follow_up_question(question, last_interaction, context):
     - Provide a structured response with key points from the retrieved documents.
     - If additional sources are needed, suggest where to find more details.
     - Should retrive sources even if the response is retriving from session memory.
+    - Only state 'I don't have information' when the question is completely outside your knowledge.
     - Response should retrive if question is related to EA and give atleast 5 points.
     
     Focused answer:
@@ -495,10 +499,14 @@ def handle_follow_up_question(question, last_interaction, context):
             follow_up_question=question
         ).strip()
         
+        # Generate suggestions for follow-ups too
+        suggestions = generate_question_suggestions(context) if context.interactions else []
+        
         response = {
             "answer": focused_answer,
             "sources": last_interaction.get('sources', []),
-            "from_memory": True
+            "from_memory": True,
+            "people_can_also_ask": suggestions if suggestions else []
         }
         context.add_interaction(question, response['answer'], response['sources'])
         return response
@@ -508,7 +516,8 @@ def handle_follow_up_question(question, last_interaction, context):
         return {
             "answer": last_interaction['answer'],
             "sources": last_interaction.get('sources', []),
-            "from_memory": True
+            "from_memory": True,
+            "people_also_ask": generate_question_suggestions(context) or None
         }
 def extract_key_points(answer_text):
     """Extract key points from a previous answer"""
@@ -538,7 +547,12 @@ def handle_clarification_response(qa_chain, question, context, file_urls):
 def detect_clarification_needed(question, context):
     """Detect if question needs clarification and setup state if needed"""
     question_lower = question.lower()
-    
+    #is_ambiguous = any(phrase in question_lower for phrase in ambiguous_phrases)
+    #if is_ambiguous and context.interactions:
+        # Check if recent context clarifies the question
+        #last_question = context.interactions[-1]['question'].lower()
+        #if fuzz.token_set_ratio(question_lower, last_question) > 70:
+           # return None
     # Check ambiguous phrases first
     is_ambiguous = any(phrase in question_lower for phrase in ambiguous_phrases)
     if is_ambiguous:
@@ -557,27 +571,31 @@ def process_regular_question(qa_chain, question, context, file_urls):
         return {
             "answer": similar_interaction['answer'],
             "sources": similar_interaction.get('sources', []),
-            "from_memory": True
+            "from_memory": True,
+            "people_also_ask": generate_question_suggestions(context) or None
         }
     
     # Process new question
     return _process_question(qa_chain, question, context, file_urls)
 
 def _process_question(qa_chain, question, context, file_urls):
-    """Handle actual question processing after clarifications"""
     try:
         # First check for similar questions in context
         similar_interaction = context.find_similar_question(question)
         if similar_interaction:
-            follow_up_message = get_follow_up_message()
-        if similar_interaction:
-            return {
+            response = {
                 "answer": f"Regarding your similar previous question:\n\n{similar_interaction['answer']}",
                 "sources": similar_interaction.get('sources', []),
                 "from_memory": True
             }
+            # Generate suggestions after adding the interaction
+            context.add_interaction(question, response['answer'], response['sources'])
+            suggestions = generate_question_suggestions(context)
+            if suggestions:
+                response["people_can_also_ask"] = suggestions
+            return response
         
-        # Rest of your existing _process_question implementation...
+        # Process the new question
         rag_response = retrieve_with_retry(qa_chain, question)
         basic_answer = rag_response.get("result", "⚠️ No relevant information found.")
         source_docs = rag_response.get("source_documents", [])
@@ -587,7 +605,7 @@ def _process_question(qa_chain, question, context, file_urls):
             context.add_interaction(question, answer)
             return {"answer": answer}
         
-        # Process sources as before
+        # Process sources
         source_strings = []
         seen_sources = set()
         for doc in source_docs:
@@ -620,12 +638,6 @@ def _process_question(qa_chain, question, context, file_urls):
                 if "Source unavailable" not in seen_sources:
                     source_strings.append("Source unavailable")
                     seen_sources.add("Source unavailable")
-
-        # Get relevant conversation history using the new interactions list
-        recent_history = "\n\n".join([
-            f"Q: {i['question']}\nA: {i['answer']}" 
-            for i in context.interactions[-3:]
-        ]) if context.interactions else ""
 
         # Enhance response with context
         llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3)
@@ -664,54 +676,76 @@ Instructions:
 Enhanced Answer:"""
 
         enhance_prompt = PromptTemplate(
-            template=enhance_template,
-            input_variables=["history", "answer", "question", "sources"]
+        template=enhance_template,
+        input_variables=["history", "answer", "question", "sources"]
         )
         enhance_chain = LLMChain(llm=llm, prompt=enhance_prompt)
         
         sources_text = "\n".join([f"- {src}" for src in source_strings]) if source_strings else "No specific sources retrieved."
         enhanced_response = enhance_chain.run(
-            history=recent_history,  # Using recent history for better focus
+            history=context.get_context(),
             answer=basic_answer,
             question=question,
             sources=sources_text
         ).strip()
+
+        # Store the interaction FIRST
+        context.add_interaction(question, enhanced_response, source_strings)
         
-        final_answer = enhanced_response
-        # Add follow-up message to encourage further interaction
-        if not is_filtered_query_type(final_answer):
-            follow_up_message = get_follow_up_message()
-            final_answer = f"{final_answer}\n\n{follow_up_message}"
-        # Store the interaction
-        context.add_interaction(question, final_answer, source_strings)
+        # THEN generate suggestions based on the complete context
+        suggestions = generate_question_suggestions(context)
         
-        # Return response
-        if is_filtered_query_type(final_answer):
-            return {"answer": final_answer}
-        else:
-            return {"answer": final_answer, "sources": source_strings}
+        # Prepare response
+        response = {
+            "answer": enhanced_response,
+            "sources": source_strings
+        }
+        
+        # Only add suggestions if not a filtered query type and we have suggestions
+        if not is_filtered_query_type(enhanced_response) and suggestions:
+            response["people_can_also_ask"] = suggestions
+            
+        return response
             
     except Exception as e:
         logger.error(f"⚠️ Error processing query: {e}")
         error_msg = f"⚠️ Sorry, I encountered an error while processing your question: {str(e)}"
         context.add_interaction(question, error_msg)
         return {"answer": error_msg}
-# Add a new function to generate follow-up messages
-def get_follow_up_message():
-    """Returns a random follow-up message to encourage further interaction"""
-    import random
+def generate_question_suggestions(context, max_suggestions=3):
+    """Generate follow-up question suggestions based on current conversation and conversation history"""
+    if not context.interactions:
+        return []
     
-    follow_up_messages = [
-        "Feel free to ask if you have any other questions about EA!",
-        "Is there anything else about EA you'd like to know?",
-        "Do you have any other EA-related questions I can help with?",
-        "I'm here to help with any other EA questions you might have.",
-        "Let me know if you need more information about any EA products or services!",
-        "Any other EA-related questions on your mind?",
-        "I'd be happy to help with any other EA questions.",
-        "Anything else about EA games or services you'd like to explore?",
-        "Feel free to ask about other EA topics if you need assistance!",
-        "Need help with anything else related to EA? Just ask!"
-    ]
+    # Use the current interaction to generate suggestions
+    current_interaction = context.interactions[-1]
+    context_text = f"Q: {current_interaction['question']}\nA: {current_interaction['answer']}"
     
-    return random.choice(follow_up_messages)
+    prompt = f"""You are an intelligent assistant helping users with their queries. Based on the current and the context of previous interactions, suggest {max_suggestions} relevant follow-up questions the user might ask next. Make each question complete and specific.
+
+Current Conversation:
+{context_text}
+
+Respond with exactly {max_suggestions} bullet point questions in this format:
+- First suggested question
+- Second suggested question
+- Third suggested question
+
+Suggested questions:"""
+    
+    try:
+        llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.5)
+        response = llm.invoke(prompt)
+        
+        suggestions = []
+        for line in response.content.split('\n'):
+            line = line.strip()
+            if line.startswith('-') or line.startswith('*'):
+                question = line[1:].strip()
+                if question and len(suggestions) < max_suggestions:
+                    suggestions.append(question)
+        
+        return suggestions[:max_suggestions] if suggestions else []
+    except Exception as e:
+        logger.error(f"Error generating suggestions: {e}")
+        return []
