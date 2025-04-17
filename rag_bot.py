@@ -12,7 +12,6 @@ from rank_bm25 import BM25Okapi
 from langchain.vectorstores import FAISS
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.document_loaders import TextLoader
 import time
 import re
 
@@ -131,35 +130,30 @@ def hybrid_search(query, bm25, vector_store, k=5):
     # Combine results (weighted average)
     combined = []
     for idx, (score, _) in enumerate(bm25_docs[:k]):
-        combined.append(("bm25", idx, score * 0.6))  # BM25 weight: 60%
+        combined.append(("bm25", idx, score * 0.7))  # BM25 weight: 60%
     for idx, doc in enumerate(faiss_docs):
-        combined.append(("faiss", idx, 0.4))  # FAISS weight: 40%
+        combined.append(("faiss", idx, 0.3))  # FAISS weight: 40%
     
     # Sort by combined score
     combined.sort(key=lambda x: x[2], reverse=True)
     return combined[:k]
-
 def create_rag_bot(vector_store):
     """Creates a RAG bot using hybrid retrieval (BM25 + FAISS)."""
     if vector_store is None:
         raise ValueError("⚠️ FAISS vector store is not loaded. Please upload documents first.")
-
     retriever = vector_store.as_retriever(
         search_type="similarity",  # Use Max Marginal Relevance for better diversity
         search_kwargs={
-            "k": 8 # Increase number of documents retrieved 
+            "k": 5 # Increase number of documents retrieved 
         }
     )
-
     llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.3)
-
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=retriever,
         return_source_documents=True
     )
- 
     return qa_chain
 
 # Static answers for frequently asked questions
@@ -191,16 +185,24 @@ ambiguous_phrases = [
     "can I use this?", "will this affect my game?", "is it required?"
 ]
 
-def check_document_relevance(doc, question, threshold=0.3):
-    if any(keyword in question.lower() for keyword in ["reaction", "feedback","accessibility", "community","strategies","teams","Franchise Mode","crash","online modes","Authentication","commentary","graphicas"]):
-         threshold = 0.1  # Lower threshold for subjective queries
-    doc_content = doc.page_content.lower()
-    question_words = set(question.lower().split())
-    overlap_count = sum(1 for word in question_words if word in doc_content)
-    relevance_score = overlap_count / len(question_words) if question_words else 0
-    return relevance_score >= threshold
+def check_document_relevance(doc, question, threshold=0.1):  # Reduced from 0.15
+    lowered_q = question.lower()
+    lowered_doc = doc.page_content.lower()
 
-def retrieve_with_retry(qa_chain, question, retries=5, delay=1):
+    # Always accept documents that contain important EA keywords
+    important_keywords = [
+        "ea sports", "electronic arts", "fifa", "madden", "nhl", 
+        "apex legends", "battlefield", "sims", "nba", "fc 24","community","commentatory"
+    ]
+    if any(kw in lowered_doc for kw in important_keywords):
+        return True
+
+    # More lenient matching for EA-related questions
+    question_words = set(lowered_q.split())
+    overlap_count = sum(1 for word in question_words if word in lowered_doc)
+    return overlap_count >= 2  # At least 2 matching words
+
+def retrieve_with_retry(qa_chain, question, retries=6, delay=1):
     for attempt in range(retries):
         try:
             response = qa_chain({"query": question})
@@ -209,7 +211,9 @@ def retrieve_with_retry(qa_chain, question, retries=5, delay=1):
             
             if response and response.get("source_documents"):
                 relevant_docs = [doc for doc in response["source_documents"] 
+                
                                if check_document_relevance(doc, question)]
+                
                 logger.info(f"Found {len(relevant_docs)} relevant documents")
                 
                 if relevant_docs:
@@ -292,7 +296,7 @@ def ask_question(qa_chain, question, session_id, file_urls):
         logger.info(f"Returning {response_type} response")
         context.add_interaction(question, answer)
         return {"answer": answer}
-    
+
     # Handle clarification responses if in clarification state
     if context.clarification_state:
         return handle_clarification_response(qa_chain, question, context, file_urls)
@@ -472,17 +476,11 @@ def handle_follow_up_question(question, last_interaction, context):
     Follow-up question: {follow_up_question}
     
     Instructions:
-    - Extract ONLY the part of the previous answer that addresses the follow-up question
-    - If the follow-up asks for details not in the previous answer, indicate that clearly
-    - Use previous conversation context when relevant to improve responses.
-    - If a similar question was asked earlier in this session, retrieve the previous response from memory instead of querying again.
-    - Do not use old session memory for unrelated questions. Ensure context is relevant before using it.
-    - Strictly answer using retrieved documents. DO NOT generate answers based on general knowledge.
-    - Provide a structured response with key points from the retrieved documents.
-    - If additional sources are needed, suggest where to find more details.
-    - Should retrive sources even if the response is retriving from session memory.
-    - Only state 'I don't have information' when the question is completely outside your knowledge.
-    - Response should retrive if question is related to EA and give atleast 5 points.
+    1. If the question is about EA, you MUST provide a detailed response with at least 3-5 key points
+2. If information is incomplete, say "Based on available information:" then provide what you know
+3. Never say "no specific mention" - instead provide related information
+4. Structure responses with clear bullet points
+5. Always try to connect to known EA products/features
     
     Focused answer:
     """
@@ -645,12 +643,11 @@ def _process_question(qa_chain, question, context, file_urls):
         enhance_template = """You are an expert knowledge assistant for EA (Electronic Arts) questions ONLY. 
 
 ### IMPORTANT: FIRST determine if the question is about EA (Electronic Arts) games, services, or products:
-- If the question is NOT related to EA, respond ONLY with:  
-  "This question does not seem related to EA. Please ask about EA-related topics such as EA games, accounts, or services."
-- DO NOT answer non-EA questions under ANY circumstances, even if you know the answer
-- If Question is unrelated or not related to EA then return an empty list for sources.
-            
-### Previous Conversations:
+1. If the question is about EA, you MUST provide a detailed response with at least 3-5 key points
+2. If information is incomplete, say "Based on available information:" then provide what you know
+3. Never say "no specific mention" - instead provide related information
+4. Structure responses with clear bullet points
+5. Always try to connect to known EA products/features
 {history}
 
 ### Retrieved Answer:
