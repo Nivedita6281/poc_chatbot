@@ -14,13 +14,18 @@ from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import time
 import re
+from collaborative_filtering import CollaborativeFilter
 
 logger = logging.getLogger(__name__)
 s3_client = boto3.client("s3")
 
 # Session memory storage (Stores last 30 interactions per session)
 session_memory = {}
-
+# Add during bot initialization
+collab_filter = CollaborativeFilter(
+    similarity_threshold=0.6,  # Adjust based on your needs
+    min_common_questions=1
+)
 class ConversationContext:
     def __init__(self, session_id):
         self.session_id = session_id
@@ -283,6 +288,7 @@ def get_conversation_context(session_id):
     session_memory[session_id].last_active = current_time
     return session_memory[session_id]
 def ask_question(qa_chain, question, session_id, file_urls):
+    collab_filter.add_question(session_id, question)
     logger.info(f"Processing question for session {session_id}: {question}")
     context = get_conversation_context(session_id)
     # First check if this is a follow-up about previous answer
@@ -710,11 +716,71 @@ Enhanced Answer:"""
         context.add_interaction(question, error_msg)
         return {"answer": error_msg}
 def generate_question_suggestions(context, max_suggestions=3):
-    """Generate follow-up question suggestions based on current conversation and conversation history"""
+    """Hybrid suggestion generator combining LLM and collaborative filtering"""
     if not context.interactions:
         return []
     
-    # Use the current interaction to generate suggestions
+    current_interaction = context.interactions[-1]
+    current_question = current_interaction['question']
+    
+    # Get suggestions from both sources
+    llm_suggestions = generate_llm_suggestions(context, max_suggestions)
+    cf_suggestions = collab_filter.get_suggestions(
+        context.session_id,
+        current_question,
+        max_suggestions=max_suggestions
+    )
+    
+    # Add logging for raw suggestions
+    logger.info(f"Raw CF suggestions: {cf_suggestions}")
+    logger.info(f"Raw LLM suggestions: {llm_suggestions}")
+    
+    # Filter CF suggestions by relevance to current topic
+    filtered_cf_suggestions = [
+        s for s in cf_suggestions 
+        if is_relevant_to_current_topic(s, current_question)
+    ]
+    
+    # Add the logging you asked about here
+    current_topic = extract_main_topic(current_question)
+    logger.info(f"Filtered CF suggestions (relevance > 50%): {filtered_cf_suggestions}")
+    if filtered_cf_suggestions:
+        suggestion_topic = extract_main_topic(filtered_cf_suggestions[0])
+        logger.info(f"Current topic: {current_topic}, Suggested topic: {suggestion_topic}")
+    
+    # Combine and deduplicate suggestions
+    combined = []
+    seen = set()
+    
+    # Prioritize collaborative suggestions first
+    for suggestion in filtered_cf_suggestions:
+        if suggestion not in seen:
+            combined.append(suggestion)
+            seen.add(suggestion)
+    
+    # Add LLM suggestions if we need more
+    for suggestion in llm_suggestions:
+        if len(combined) >= max_suggestions:
+            break
+        if suggestion not in seen:
+            combined.append(suggestion)
+            seen.add(suggestion)
+    
+    return combined[:max_suggestions]
+def is_relevant_to_current_topic(suggestion, current_question):
+    """Check if suggestion is relevant to current question topic"""
+    current_topic = extract_main_topic(current_question)
+    suggestion_topic = extract_main_topic(suggestion)
+     
+    return fuzz.token_set_ratio(current_topic, suggestion_topic) > 50
+def extract_main_topic(text):
+    """Extract main topic from question text"""
+    # Remove common question words
+    stop_words = {"what", "how", "why", "when", "where", "which", "are", "is", "do", "does"}
+    words = [w for w in text.lower().split() if w not in stop_words]
+    return " ".join(words[:4])  # First few meaningful words
+def generate_llm_suggestions(context, max_suggestions):
+    """Your original LLM-based suggestion generation"""
     current_interaction = context.interactions[-1]
     context_text = f"Q: {current_interaction['question']}\nA: {current_interaction['answer']}"
     
@@ -744,5 +810,5 @@ Suggested questions:"""
         
         return suggestions[:max_suggestions] if suggestions else []
     except Exception as e:
-        logger.error(f"Error generating suggestions: {e}")
+        logger.error(f"Error generating LLM suggestions: {e}")
         return []
