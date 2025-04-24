@@ -771,14 +771,19 @@ def is_relevant_to_current_topic(suggestion, current_question):
     """Check if suggestion is relevant to current question topic"""
     current_topic = extract_main_topic(current_question)
     suggestion_topic = extract_main_topic(suggestion)
-     
-    return fuzz.token_set_ratio(current_topic, suggestion_topic) > 50
+    # Use multiple similarity measures
+    token_ratio = fuzz.token_set_ratio(current_topic, suggestion_topic)
+    seq_ratio = fuzz.token_sort_ratio(current_topic, suggestion_topic)
+    
+    # Consider the higher of the two scores
+    return max(token_ratio, seq_ratio) > 50
 def extract_main_topic(text):
     """Extract main topic from question text"""
-    # Remove common question words
-    stop_words = {"what", "how", "why", "when", "where", "which", "are", "is", "do", "does"}
+    stop_words = {"what", "how", "why", "when", "where", "which", "are", "is", "do", "does", 
+                 "can", "could", "would", "will", "the", "a", "an", "and", "or", "for"}
     words = [w for w in text.lower().split() if w not in stop_words]
-    return " ".join(words[:4])  # First few meaningful words
+    # Take more words or up to a certain length (e.g., 6-8 words)
+    return " ".join(words[:8])   # First few meaningful words
 def generate_llm_suggestions(context, max_suggestions):
     """Your original LLM-based suggestion generation"""
     current_interaction = context.interactions[-1]
