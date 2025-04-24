@@ -89,9 +89,10 @@ class CollaborativeFilter:
 
     def _extract_topic(self, text: str) -> str:
         """Extract main topic from question text"""
-        stop_words = {"what", "how", "why", "when", "where", "which", "are", "is", "do", "does"}
+        stop_words = {"what", "how", "why", "when", "where", "which", "are", "is", "do", "does",
+                      "can", "could", "would", "will", "the", "a", "an", "and", "or", "for"}
         words = [w for w in text.lower().split() if w not in stop_words]
-        return " ".join(words[:4])
+        return " ".join(words[:8])
 
     def _generate_suggestions(self, current_session: str, current_question: str, 
                             similar_users: List[Tuple[str, float]], max_suggestions: int) -> List[str]:
